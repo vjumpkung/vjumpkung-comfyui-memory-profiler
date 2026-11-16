@@ -1,0 +1,7 @@
+name_prefix: memory_profile   # files: output/vjumpkung_memory_profiler/<prefix>_00001_.json/.png
+require_node: true            # only profile prompts that contain a Memory Profiler node
+save_format: both             # json | png | both
+per_node: true                # snapshot after every executed node
+block_residency: true         # per-block VRAM/RAM of loaded models (each snapshot)
+cached_outputs: true          # end of run: memory held by node outputs, by type
+tensor_scan: false            # end of run / manual: all live torch tensors (slow)
