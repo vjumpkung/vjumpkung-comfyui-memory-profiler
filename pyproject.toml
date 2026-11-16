@@ -1,8 +1,8 @@
 [project]
 name = "vjumpkung-comfyui-memory-profiler"
 description = "Records per-node VRAM, RAM and per-block model residency profiles of ComfyUI runs."
-version = "0.1.0"
-dependencies = []
+version = "0.2.0"
+dependencies = ["matplotlib"]
 
 [tool.comfy]
 PublisherId = "vjumpkung"

@@ -1,11 +1,12 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-async function snapshot(format) {
+async function snapshot(node, format) {
+    const widget = (name) => node.widgets.find((w) => w.name === name).value;
     const response = await api.fetchApi("/vjumpkung_memory_profiler/snapshot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ format }),
+        body: JSON.stringify({ format, file_prefix: widget("file_prefix"), file_suffix: widget("file_suffix") }),
     });
     const data = await response.json().catch(() => ({}));
     if (response.ok) {
@@ -30,9 +31,9 @@ app.registerExtension({
     getNodeMenuItems(node) {
         if (node.constructor.comfyClass !== "VjumpkungMemoryProfiler") return [];
         return [
-            { content: "Memory snapshot (JSON)", callback: () => snapshot("json") },
-            { content: "Memory snapshot (PNG)", callback: () => snapshot("png") },
-            { content: "Memory snapshot (JSON + PNG)", callback: () => snapshot("both") },
+            { content: "Memory snapshot (JSON)", callback: () => snapshot(node, "json") },
+            { content: "Memory snapshot (PNG)", callback: () => snapshot(node, "png") },
+            { content: "Memory snapshot (JSON + PNG)", callback: () => snapshot(node, "both") },
         ];
     },
 });

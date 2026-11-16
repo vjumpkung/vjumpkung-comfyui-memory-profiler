@@ -47,21 +47,30 @@ def load_config():
         return {**DEFAULTS, **(yaml.safe_load(f) or {})}
 
 
-def memory_stats(torch_stats):
+def file_name(config, prefix, suffix):
+    # keep every profile directly in SUBFOLDER, where list_profiles looks
+    name = "_".join(part for part in (prefix, config["name_prefix"], suffix) if part)
+    return name.replace("/", "_").replace("\\", "_") or DEFAULTS["name_prefix"]
+
+
+def memory_stats():
     device = comfy.model_management.get_torch_device()
-    stats = dict.fromkeys(("vram_free", "vram_total", "aimdo_vram", "torch_allocated", "torch_reserved", "torch_peak"))
+    stats = dict.fromkeys(("vram_total", "process_vram", "aimdo_vram", "torch_allocated", "torch_reserved", "torch_peak"))
     stats["ram_total"] = comfy.system_memory.virtual_memory_total()
-    stats["ram_available"] = comfy.system_memory.virtual_memory_available()
     stats["process_rss"] = PROCESS.memory_info().rss
     stats["pinned"] = comfy.model_management.TOTAL_PINNED_MEMORY
     if device.type == "cuda":
-        stats["vram_free"], stats["vram_total"] = torch.cuda.mem_get_info(device)
+        stats["vram_total"] = torch.cuda.get_device_properties(device).total_memory
+        stats["torch_allocated"] = torch.cuda.memory_allocated(device)
+        stats["torch_reserved"] = torch.cuda.memory_reserved(device)
+        stats["torch_peak"] = torch.cuda.max_memory_allocated(device)
+        stats["process_vram"] = stats["torch_reserved"]
         if comfy.memory_management.aimdo_enabled:
+            # aimdo counts every allocation it hooks, torch included, but not freed memory the cudaMallocAsync pool keeps
             stats["aimdo_vram"] = comfy_aimdo.control.get_total_vram_usage()
-        if torch_stats:
-            stats["torch_allocated"] = torch.cuda.memory_allocated(device)
-            stats["torch_reserved"] = torch.cuda.memory_reserved(device)
-            stats["torch_peak"] = torch.cuda.max_memory_allocated(device)
+            stats["process_vram"] = stats["aimdo_vram"]
+            if torch.cuda.get_allocator_backend() == "cudaMallocAsync":
+                stats["process_vram"] += stats["torch_reserved"] - stats["torch_allocated"]
     return stats
 
 
@@ -187,14 +196,14 @@ def tensor_scan():
     return sorted(groups.values(), key=lambda g: g["bytes"], reverse=True)
 
 
-def snapshot(config, torch_stats):
-    return {"memory": memory_stats(torch_stats), "models": model_stats(config["block_residency"])}
+def snapshot(config):
+    return {"memory": memory_stats(), "models": model_stats(config["block_residency"])}
 
 
 def make_report(kind, config, final, timeline):
     device = comfy.model_management.get_torch_device()
     return {
-        "version": 1,
+        "version": 2,
         "kind": kind,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "device": comfy.model_management.get_torch_device_name(device),
@@ -217,8 +226,8 @@ def list_profiles():
     return sorted(files, key=lambda f: os.path.getmtime(os.path.join(folder, f)), reverse=True)
 
 
-def save(report, save_format):
-    folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(os.path.join(SUBFOLDER, report["config"]["name_prefix"]), folder_paths.get_output_directory())
+def save(report, save_format, name):
+    folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(os.path.join(SUBFOLDER, name), folder_paths.get_output_directory())
     stem = f"{filename}_{counter:05}_"
     files = []
     if save_format != "png":
@@ -232,24 +241,27 @@ def save(report, save_format):
     return files
 
 
-def manual_snapshot(save_format):
+def manual_snapshot(save_format, prefix, suffix):
     config = load_config()
-    final = snapshot(config, torch_stats=not comfy.memory_management.aimdo_enabled)
+    final = snapshot(config)
     if config["tensor_scan"]:
         final["tensors"] = tensor_scan()
-    return save(make_report("manual", config, final, []), save_format)
+    return save(make_report("manual", config, final, []), save_format, file_name(config, prefix, suffix))
 
 
 def start_session(prompt):
     try:
         config = load_config()
-        if config["require_node"] and not any(node.get("class_type") == NODE_ID for node in prompt.values()):
+        node = next((node for node in prompt.values() if node.get("class_type") == NODE_ID), {})
+        if config["require_node"] and not node:
             return None
+        inputs = node.get("inputs", {})
         device = comfy.model_management.get_torch_device()
         cuda = device.type == "cuda"
         if cuda:
             torch.cuda.reset_peak_memory_stats(device)
-        return {"config": config, "device": device, "cuda": cuda, "timeline": [], "peak": 0, "start": time.perf_counter()}
+        name = file_name(config, inputs.get("file_prefix", ""), inputs.get("file_suffix", ""))
+        return {"config": config, "name": name, "device": device, "cuda": cuda, "timeline": [], "peak": 0, "start": time.perf_counter()}
     except Exception:
         logging.exception("Memory Profiler: failed to start profiling")
         return None
@@ -257,7 +269,7 @@ def start_session(prompt):
 
 def record_node(session, node_id, class_type, status, seconds):
     try:
-        entry = {"node_id": node_id, "class_type": class_type, "status": status, "seconds": seconds, **snapshot(session["config"], True)}
+        entry = {"node_id": node_id, "class_type": class_type, "status": status, "seconds": seconds, **snapshot(session["config"])}
         session["timeline"].append(entry)
         if entry["memory"]["torch_peak"] is not None:
             session["peak"] = max(session["peak"], entry["memory"]["torch_peak"])
@@ -268,7 +280,7 @@ def record_node(session, node_id, class_type, status, seconds):
 def finish_session(session, executor, prompt, prompt_id):
     try:
         config = session["config"]
-        final = snapshot(config, True)
+        final = snapshot(config)
         if config["cached_outputs"]:
             final["outputs"] = output_stats(executor, prompt)
         if config["tensor_scan"]:
@@ -277,7 +289,7 @@ def finish_session(session, executor, prompt, prompt_id):
             final["memory"]["torch_peak"] = max(session["peak"], final["memory"]["torch_peak"])
         report = make_report("run", config, final, session["timeline"])
         report.update(prompt_id=prompt_id, success=executor.success, seconds=time.perf_counter() - session["start"])
-        save(report, config["save_format"])
+        save(report, config["save_format"], session["name"])
     except Exception:
         logging.exception("Memory Profiler: failed to save profile")
 

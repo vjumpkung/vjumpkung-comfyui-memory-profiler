@@ -21,13 +21,16 @@ class MemoryProfiler(io.ComfyNode):
             node_id=profiler.NODE_ID,
             display_name="Memory Profiler",
             category="utils/memory_profiler",
-            description="Records a memory profile of every run into output/vjumpkung_memory_profiler. Right-click for an instant snapshot.",
-            inputs=[],
+            description="Records a memory profile of every run into output/vjumpkung_memory_profiler as <file_prefix>_<name_prefix>_<file_suffix>_00001_. Right-click for an instant snapshot.",
+            inputs=[
+                io.String.Input("file_prefix", default="", socketless=True, tooltip="Added before the config name_prefix."),
+                io.String.Input("file_suffix", default="", socketless=True, tooltip="Added after the config name_prefix, before the counter."),
+            ],
             outputs=[],
         )
 
     @classmethod
-    def execute(cls) -> io.NodeOutput:
+    def execute(cls, file_prefix, file_suffix) -> io.NodeOutput:
         return io.NodeOutput()
 
 
@@ -58,12 +61,13 @@ class MemoryProfileToImage(io.ComfyNode):
 
 @server.PromptServer.instance.routes.post("/vjumpkung_memory_profiler/snapshot")
 async def snapshot(request):
-    save_format = (await request.json()).get("format")
+    body = await request.json()
+    save_format = body.get("format")
     if save_format not in ("json", "png", "both"):
         return web.json_response({"error": "format must be json, png or both"}, status=400)
     if server.PromptServer.instance.prompt_queue.currently_running:
         return web.json_response({"error": "Snapshots are unavailable while a prompt is running"}, status=409)
-    return web.json_response({"files": profiler.manual_snapshot(save_format)})
+    return web.json_response({"files": profiler.manual_snapshot(save_format, body.get("file_prefix", ""), body.get("file_suffix", ""))})
 
 
 class MemoryProfilerExtension(ComfyExtension):

@@ -1,237 +1,159 @@
 import math
 
-from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+from matplotlib import colormaps
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
+from PIL import Image
 
-FONT = ImageFont.load_default(size=14)
-TITLE = ImageFont.load_default(size=20)
+GB = 1 << 30
+WIDTH = 13  # inches, 1300 px at DPI
+DPI = 100
+LINE = 0.16  # inches per text line or heatmap row
+RESIDENCY = colormaps["viridis"].with_extremes(bad="lightgrey")
 
-WIDTH = 1300
-GAP = 12
-PAD = 12
-ROW = 16
-
-BG = (24, 26, 31)
-FG = (225, 228, 235)
-DIM = (140, 146, 158)
-GRID = (52, 56, 66)
-ABSENT = (58, 62, 72)
-RAM = (66, 133, 244)
-VRAM = (76, 175, 80)
-OTHER = (255, 193, 7)
-
-
-def _vram_used(memory):
-    if memory["vram_total"] is None:
-        return None
-    return memory["vram_total"] - memory["vram_free"]
-
-
-SERIES = (
-    ("VRAM used", VRAM, _vram_used),
-    ("aimdo VRAM", OTHER, lambda m: m["aimdo_vram"]),
-    ("torch peak (in node)", (239, 83, 80), lambda m: m["torch_peak"]),
-    ("torch allocated", (171, 71, 188), lambda m: m["torch_allocated"]),
-    ("process RSS", RAM, lambda m: m["process_rss"]),
-)
+VRAM_SERIES = (("process VRAM", "process_vram"), ("torch allocated", "torch_allocated"), ("torch peak (in node)", "torch_peak"))
+RAM_SERIES = (("process RAM (RSS)", "process_rss"), ("pinned RAM", "pinned"))
 
 
 def _fmt(n):
     if n is None:
         return "-"
-    if n >= 1 << 30:
-        return f"{n / (1 << 30):.2f} GB"
+    if n >= GB:
+        return f"{n / GB:.2f} GB"
     return f"{n / (1 << 20):.2f} MB"
 
 
-def _canvas(width, height):
-    image = Image.new("RGB", (width, height), BG)
-    return image, ImageDraw.Draw(image)
+def _clip(text, limit=60):
+    return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
-def _lerp(a, b, t):
-    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
-
-
-def _clip(text, limit):
-    while len(text) > 4 and FONT.getlength(text) > limit:
-        text = text[:-4] + "..."
-    return text
-
-
-def _label_step(slot):
-    return max(1, math.ceil(28 / slot))
-
-
-def _header(report):
+def _header_lines(report):
     memory = report["final"]["memory"]
-    ram_used = memory["ram_total"] - memory["ram_available"]
     lines = [f"{report['created']}   device: {report['device']}   aimdo: {'on' if report['aimdo'] else 'off'}"]
     if report["kind"] == "run":
         lines.append(f"prompt {report['prompt_id']}   {'success' if report['success'] else 'failed'}   {report['seconds']:.2f}s   {len(report['timeline'])} nodes")
-    lines.append(f"VRAM   used {_fmt(_vram_used(memory))} / {_fmt(memory['vram_total'])}   aimdo {_fmt(memory['aimdo_vram'])}   torch allocated {_fmt(memory['torch_allocated'])}   reserved {_fmt(memory['torch_reserved'])}   peak {_fmt(memory['torch_peak'])}")
-    lines.append(f"RAM    used {_fmt(ram_used)} / {_fmt(memory['ram_total'])}   process {_fmt(memory['process_rss'])}   pinned {_fmt(memory['pinned'])}")
-    image, draw = _canvas(WIDTH, 2 * PAD + 30 + ROW * len(lines))
-    draw.text((PAD, PAD), f"Memory profile ({report['kind']})", font=TITLE, fill=FG)
-    for i, line in enumerate(lines):
-        draw.text((PAD, PAD + 30 + ROW * i), line, font=FONT, fill=FG)
-    return image
+    if memory["vram_total"] is not None:
+        lines.append(f"VRAM  process {_fmt(memory['process_vram'])} of {_fmt(memory['vram_total'])}   aimdo {_fmt(memory['aimdo_vram'])}   torch allocated {_fmt(memory['torch_allocated'])}   reserved {_fmt(memory['torch_reserved'])}   peak {_fmt(memory['torch_peak'])}")
+    lines.append(f"RAM   process {_fmt(memory['process_rss'])} of {_fmt(memory['ram_total'])}   pinned {_fmt(memory['pinned'])}")
+    return lines
 
 
-def _timeline(timeline):
-    count = len(timeline)
-    series = []
-    for label, color, get in SERIES:
-        values = [get(entry["memory"]) for entry in timeline]
-        if any(v is not None for v in values):
-            series.append((label, color, values))
-    chart = 300 if series else 0
-    rows = -(-count // 3)
-    image, draw = _canvas(WIDTH, chart + PAD + ROW * rows + PAD)
-    if series:
-        x0, x1, y0, y1 = 90, WIDTH - 20, 36, chart - 28
-        peak = max(v for _, _, values in series for v in values if v is not None) or 1
-        for i in range(5):
-            y = y1 - (y1 - y0) * i // 4
-            draw.line([(x0, y), (x1, y)], fill=GRID)
-            draw.text((x0 - 8, y), _fmt(peak * i / 4), font=FONT, fill=DIM, anchor="rm")
-        slot = (x1 - x0) / count
-        step = _label_step(slot)
-        for i in range(count - 1, -1, -step):
-            draw.text((x0 + slot * (i + 0.5), y1 + 6), str(i + 1), font=FONT, fill=DIM, anchor="ma")
-        legend_x = x0
-        for label, color, values in series:
-            points = [(x0 + slot * (i + 0.5), y1 - (y1 - y0) * v / peak) for i, v in enumerate(values) if v is not None]
-            if len(points) > 1:
-                draw.line(points, fill=color, width=2)
-            if count <= 100:
-                for x, y in points:
-                    draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=color)
-            draw.rectangle([legend_x, 12, legend_x + 12, 24], fill=color)
-            draw.text((legend_x + 18, 10), label, font=FONT, fill=FG)
-            legend_x += 18 + FONT.getlength(label) + 24
-    column = (WIDTH - 2 * PAD) // 3
-    for i, entry in enumerate(timeline):
-        text = f"{i + 1}. #{entry['node_id']} {entry['class_type']} {entry['status']} {entry['seconds']:.2f}s"
-        draw.text((PAD + column * (i % 3), chart + PAD + ROW * (i // 3)), _clip(text, column - 8), font=FONT, fill=FG)
-    return image
+def _header(subfig, report, lines):
+    ax = subfig.subplots()
+    ax.axis("off")
+    ax.set_title(f"Memory profile ({report['kind']}), ComfyUI process only", loc="left", fontsize=14)
+    ax.text(0, 1, "\n".join(lines), transform=ax.transAxes, va="top", family="monospace", fontsize=9)
 
 
-def _legend():
-    image, draw = _canvas(WIDTH, 2 * PAD + 30 + ROW + 4)
-    draw.text((PAD, PAD), "Model residency", font=TITLE, fill=FG)
-    y = PAD + 30
-    draw.text((PAD, y), "columns: node execution order, end = final", font=FONT, fill=DIM)
-    x = PAD + 340
-    draw.text((x, y), "RAM", font=FONT, fill=FG)
-    x += 40
-    for i in range(160):
-        draw.line([(x + i, y + 1), (x + i, y + ROW - 2)], fill=_lerp(RAM, VRAM, i / 159))
-    draw.text((x + 170, y), "VRAM", font=FONT, fill=FG)
-    draw.rectangle([x + 230, y + 1, x + 244, y + ROW - 2], fill=ABSENT)
-    draw.text((x + 252, y), "not loaded", font=FONT, fill=FG)
-    return image
+def _timeline(subfig, timeline, cuda):
+    charts = [("VRAM", VRAM_SERIES)] if cuda else []
+    charts.append(("RAM", RAM_SERIES))
+    steps = range(1, len(timeline) + 1)
+    for ax, (title, series) in zip(subfig.subplots(len(charts), 1, squeeze=False)[:, 0], charts):
+        for label, key in series:
+            ax.plot(steps, [entry["memory"][key] / GB for entry in timeline], marker="o" if len(timeline) <= 100 else None, markersize=3, label=label)
+        ax.set_title(f"{title} used by the ComfyUI process", loc="left", fontsize=10)
+        ax.set_xlabel("node (execution order)")
+        ax.set_ylabel("GB")
+        ax.set_xlim(0.5, len(timeline) + 0.5)
+        ax.set_ylim(bottom=0)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left", fontsize=8)
 
 
-def _heatmap(model_id, present):
+def _nodes(subfig, timeline):
+    ax = subfig.subplots()
+    ax.axis("off")
+    lines = [_clip(f"{i + 1}. #{entry['node_id']} {entry['class_type']} {entry['status']} {entry['seconds']:.2f}s") for i, entry in enumerate(timeline)]
+    rows = -(-len(lines) // 3)
+    for column in range(3):
+        ax.text(column / 3, 1, "\n".join(lines[column * rows:(column + 1) * rows]), transform=ax.transAxes, va="top", family="monospace", fontsize=8)
+
+
+def _residency(model_id, present):
     entries = [models.get(model_id) for models in present]
     first = next(e for e in entries if e)
-    last = entries[-1]
     blocks = [{b["name"]: b for b in e.get("blocks", [])} if e else {} for e in entries]
     names = list(dict.fromkeys(name for column in blocks for name in column))
-    rows = []
-    if names:
-        for name in names:
-            size = next(column[name]["size"] for column in blocks if name in column)
-            ratios = [column[name]["vram"] / column[name]["size"] if name in column else None for column in blocks]
-            rows.append((f"{name}  {_fmt(size)}", ratios))
-    else:
-        ratios = [e["loaded"] / e["size"] if e and e["size"] else None for e in entries]
-        rows.append((f"(whole model)  {_fmt(first['size'])}", ratios))
-
-    label_width = min(420, int(max(FONT.getlength(label) for label, _ in rows)) + 12)
-    cell = max(4, min(200, (WIDTH - label_width - 2 * PAD) // len(entries)))
-    image, draw = _canvas(max(WIDTH, label_width + 2 * PAD + cell * len(entries)), PAD + ROW + ROW + ROW * len(rows) + PAD)
-    title = f"{first['name']}  {'dynamic' if first['dynamic'] else 'static'}  {first['device']}  size {_fmt(first['size'])}"
-    if last:
-        title += f"   end: loaded {_fmt(last['loaded'])}  pinned {_fmt(last['pinned'])}  host RAM {_fmt(last['host_ram'])}"
-    else:
-        title += "   end: not loaded"
-    draw.text((PAD, PAD // 2), title, font=FONT, fill=FG)
-    x0 = PAD + label_width
-    step = _label_step(cell)
-    for i in range(len(entries) - 1, -1, -step):
-        draw.text((x0 + cell * i, PAD + ROW - 2), "end" if i == len(entries) - 1 else str(i + 1), font=FONT, fill=DIM)
-    for r, (label, ratios) in enumerate(rows):
-        y = PAD + 2 * ROW + ROW * r
-        draw.text((PAD, y), _clip(label, label_width - 12), font=FONT, fill=FG)
-        for c, ratio in enumerate(ratios):
-            color = ABSENT if ratio is None else _lerp(RAM, VRAM, min(1, ratio))
-            draw.rectangle([x0 + cell * c, y, x0 + cell * (c + 1) - (2 if cell >= 6 else 1), y + ROW - 2], fill=color)
-    return image
+    if not names:
+        return first, entries[-1], [f"(whole model)  {_fmt(first['size'])}"], [[e["loaded"] / e["size"] if e and e["size"] else np.nan for e in entries]]
+    labels = [_clip(f"{name}  {_fmt(next(column[name]['size'] for column in blocks if name in column))}") for name in names]
+    ratios = [[column[name]["vram"] / column[name]["size"] if name in column else np.nan for column in blocks] for name in names]
+    return first, entries[-1], labels, ratios
 
 
-def _heatmaps(report):
-    present = [{m["id"]: m for m in snap["models"]} for snap in [*report["timeline"], report["final"]]]
-    model_ids = list(dict.fromkeys(i for models in present for i in models))
-    if not model_ids:
-        return []
-    return [_legend(), *(_heatmap(i, present) for i in model_ids)]
+def _heatmaps(subfig, heatmaps):
+    axes = subfig.subplots(len(heatmaps), 1, squeeze=False, height_ratios=[len(labels) for _, _, labels, _ in heatmaps])[:, 0]
+    for ax, (first, last, labels, ratios) in zip(axes, heatmaps):
+        image = ax.imshow(np.array(ratios), aspect="auto", interpolation="nearest", cmap=RESIDENCY, vmin=0, vmax=1)
+        columns = len(ratios[0])
+        ticks = range(columns - 1, -1, -math.ceil(columns / 40))
+        ax.set_xticks(ticks, ["end" if i == columns - 1 else str(i + 1) for i in ticks], fontsize=7)
+        ax.set_yticks(range(len(labels)), labels, fontsize=7)
+        title = f"{first['name']}  {'dynamic' if first['dynamic'] else 'static'}  {first['device']}  size {_fmt(first['size'])}"
+        title += f"   end: loaded {_fmt(last['loaded'])}  pinned {_fmt(last['pinned'])}  host RAM {_fmt(last['host_ram'])}" if last else "   end: not loaded"
+        ax.set_title(title, loc="left", fontsize=9)
+    subfig.colorbar(image, ax=axes, fraction=0.015, pad=0.01, label="fraction in VRAM (0 = RAM)")
+    subfig.suptitle("Model residency   columns: node execution order, end = final   grey: not loaded", x=0.01, ha="left", fontsize=11)
 
 
-def _outputs(outputs):
+def _table(ax, title, columns, rows, widths):
+    ax.axis("off")
+    ax.set_title(title, loc="left", fontsize=10)
+    table = ax.table(cellText=rows, colLabels=columns, colWidths=widths, cellLoc="left", bbox=[0, 0, 1, 1])
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+
+
+def _outputs(subfig, outputs):
     by_type = outputs["by_type"]
-    top = outputs["by_node"][:10]
-    largest = max((sum(d.values()) for d in by_type.values()), default=1)
-    image, draw = _canvas(WIDTH, 2 * PAD + 30 + ROW * len(by_type) + 2 * ROW + ROW * len(top))
-    draw.text((PAD, PAD), "Cached node outputs", font=TITLE, fill=FG)
-    y = PAD + 30
-    bar_x, bar_width = PAD + 130, 500
-    for io_type, devices in by_type.items():
-        draw.text((PAD, y), io_type, font=FONT, fill=FG)
-        x = bar_x
-        for device, size in devices.items():
-            width = max(1, round(bar_width * size / largest))
-            draw.rectangle([x, y + 1, x + width - 1, y + ROW - 2], fill=RAM if device == "cpu" else VRAM)
-            x += width
-        breakdown = "  ".join(f"{device} {_fmt(size)}" for device, size in devices.items())
-        draw.text((bar_x + bar_width + 12, y), f"{_fmt(sum(devices.values()))}   ({breakdown})", font=FONT, fill=FG)
-        y += ROW
-    draw.text((PAD, y + ROW // 2), "largest nodes", font=FONT, fill=DIM)
-    y += ROW + ROW // 2
-    for node in top:
-        draw.text((PAD, y), f"#{node['node_id']} {node['class_type']}  {node['type']}  {_fmt(node['bytes'])}", font=FONT, fill=FG)
-        y += ROW
-    return image
+    types = list(by_type)
+    bar_ax, table_ax = subfig.subplots(1, 2, width_ratios=[3, 2])
+    left = np.zeros(len(types))
+    for device in dict.fromkeys(d for devices in by_type.values() for d in devices):
+        sizes = np.array([by_type[t].get(device, 0) / GB for t in types])
+        bars = bar_ax.barh(types, sizes, left=left, label=device)
+        left += sizes
+    bar_ax.bar_label(bars, [_fmt(sum(by_type[t].values())) for t in types], padding=3, fontsize=8)
+    bar_ax.invert_yaxis()
+    bar_ax.margins(x=0.2)
+    bar_ax.set_xlabel("GB")
+    bar_ax.set_title("Cached node outputs", loc="left", fontsize=10)
+    bar_ax.legend(fontsize=8)
+    rows = [(f"#{n['node_id']}", n["class_type"], n["type"], _fmt(n["bytes"])) for n in outputs["by_node"][:10]]
+    _table(table_ax, "Largest nodes", ("node", "class", "type", "size"), rows, (0.1, 0.42, 0.28, 0.2))
 
 
-def _tensors(groups):
-    groups = groups[:20]
-    image, draw = _canvas(WIDTH, 2 * PAD + 30 + ROW * (len(groups) + 1))
-    draw.text((PAD, PAD), "Live tensors", font=TITLE, fill=FG)
-    columns = (PAD, PAD + 140, PAD + 340, PAD + 460)
-    y = PAD + 30
-    for x, text in zip(columns, ("device", "dtype", "count", "size")):
-        draw.text((x, y), text, font=FONT, fill=DIM)
-    for group in groups:
-        y += ROW
-        for x, text in zip(columns, (group["device"], group["dtype"], str(group["count"]), _fmt(group["bytes"]))):
-            draw.text((x, y), text, font=FONT, fill=FG)
-    return image
+def _tensors(subfig, groups):
+    rows = [(g["device"], g["dtype"], g["count"], _fmt(g["bytes"])) for g in groups[:20]]
+    _table(subfig.subplots(), "Live tensors", ("device", "dtype", "count", "size"), rows, (0.3, 0.3, 0.2, 0.2))
 
 
 def render(report):
     final = report["final"]
-    sections = [_header(report)]
-    if report["timeline"]:
-        sections.append(_timeline(report["timeline"]))
-    sections += _heatmaps(report)
-    if "outputs" in final:
-        sections.append(_outputs(final["outputs"]))
-    if "tensors" in final:
-        sections.append(_tensors(final["tensors"]))
-    image = Image.new("RGB", (max(s.width for s in sections), sum(s.height for s in sections) + GAP * (len(sections) - 1)), BG)
-    y = 0
-    for section in sections:
-        image.paste(section, (0, y))
-        y += section.height + GAP
-    return image
+    timeline = report["timeline"]
+    cuda = final["memory"]["vram_total"] is not None
+    lines = _header_lines(report)
+    panels = [(0.5 + LINE * len(lines), _header, report, lines)]
+    if timeline:
+        panels.append((0.4 + 2.6 * (2 if cuda else 1), _timeline, timeline, cuda))
+        panels.append((0.2 + LINE * -(-len(timeline) // 3), _nodes, timeline))
+    present = [{m["id"]: m for m in snap["models"]} for snap in [*timeline, final]]
+    heatmaps = [_residency(i, present) for i in dict.fromkeys(i for models in present for i in models)]
+    if heatmaps:
+        panels.append((0.5 + sum(0.75 + LINE * len(labels) for _, _, labels, _ in heatmaps), _heatmaps, heatmaps))
+    if final.get("outputs", {}).get("by_node"):
+        outputs = final["outputs"]
+        panels.append((0.6 + 0.22 * max(len(outputs["by_type"]), min(10, len(outputs["by_node"])) + 1), _outputs, outputs))
+    if final.get("tensors"):
+        panels.append((0.5 + 0.22 * (min(20, len(final["tensors"])) + 1), _tensors, final["tensors"]))
+    figure = Figure(figsize=(WIDTH, sum(p[0] for p in panels)), dpi=DPI, layout="constrained")
+    subfigs = figure.subfigures(len(panels), 1, squeeze=False, height_ratios=[p[0] for p in panels])[:, 0]
+    for subfig, (_, draw, *args) in zip(subfigs, panels):
+        draw(subfig, *args)
+    canvas = FigureCanvasAgg(figure)
+    canvas.draw()
+    return Image.fromarray(np.asarray(canvas.buffer_rgba())).convert("RGB")

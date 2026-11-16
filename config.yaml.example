@@ -1,4 +1,4 @@
-name_prefix: memory_profile   # files: output/vjumpkung_memory_profiler/<prefix>_00001_.json/.png
+name_prefix: memory_profile   # files: output/vjumpkung_memory_profiler/[<file_prefix>_]<name_prefix>[_<file_suffix>]_00001_.json/.png
 require_node: true            # only profile prompts that contain a Memory Profiler node
 save_format: both             # json | png | both
 per_node: true                # snapshot after every executed node
